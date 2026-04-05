@@ -10,7 +10,6 @@ CORS(app)
 
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 DB_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "araxis.db")
-STRIPE_KEY = os.environ.get("STRIPE_SECRET_KEY", "")  # ← variable Railway
 
 PLANS = {"weekly": 7, "monthly": 30, "lifetime": 36500}
 
@@ -123,6 +122,7 @@ def log_it(uid, action, details="", ip=""):
         con.commit()
 
 def gen_activation_key(plan):
+    """Génère une clé du type ARX-MO-XXXXX-XXXXX-XXXXX"""
     chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
     seg = lambda: ''.join(random.choices(chars, k=5))
     pfx = {"weekly": "WK", "monthly": "MO", "lifetime": "LT"}.get(plan, "XX")
@@ -169,7 +169,12 @@ def register():
             con.execute("INSERT INTO users (id,email,password) VALUES (?,?,?)", (uid,em,h))
             con.commit()
         log_it(uid, "REGISTER", em, request.remote_addr)
-        return jsonify({"token": make_token(uid), "message": "Compte créé"})
+        token = make_token(uid)
+        return jsonify({
+            "token": token,
+            "user": {"id": uid, "email": em, "role": "user"},
+            "message": "Compte créé"
+        })
     except sqlite3.IntegrityError:
         return jsonify({"error":"Email déjà utilisé"}), 409
 
@@ -205,45 +210,6 @@ def me(u):
         "subscription": sub_info(sub),
     })
 
-# ── STRIPE — PAYMENT INTENT ───────────────────────────────────────────────────────
-@app.post("/api/create-payment-intent")
-def create_payment_intent():
-    """
-    Appelé par le site web pour créer un PaymentIntent Stripe.
-    Nécessite la variable d'environnement STRIPE_SECRET_KEY sur Railway.
-    """
-    if not STRIPE_KEY:
-        return jsonify({"error": "Stripe non configuré sur le serveur (variable STRIPE_SECRET_KEY manquante)"}), 500
-
-    try:
-        import stripe
-        stripe.api_key = STRIPE_KEY
-    except ImportError:
-        return jsonify({"error": "Module stripe non installé — ajoutez 'stripe' dans requirements.txt"}), 500
-
-    d      = request.json or {}
-    amount = int(d.get("amount", 0))   # en centimes
-    email  = d.get("email", "").strip().lower()
-    plan   = d.get("plan", "monthly")
-
-    if amount <= 0:
-        return jsonify({"error": "Montant invalide"}), 400
-
-    try:
-        intent = stripe.PaymentIntent.create(
-            amount=amount,
-            currency="eur",
-            receipt_email=email if email else None,
-            metadata={"plan": plan, "email": email},
-            automatic_payment_methods={"enabled": True},
-        )
-        log_it(None, "PAYMENT_INTENT_CREATED", f"plan={plan} amount={amount} email={email}", request.remote_addr)
-        return jsonify({"clientSecret": intent.client_secret})
-    except stripe.error.StripeError as e:
-        return jsonify({"error": str(e.user_message or e)}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 # ── SUBSCRIPTION ─────────────────────────────────────────────────────────────────
 @app.post("/api/subscription/verify")
 @auth_required
@@ -274,14 +240,21 @@ def apply_promo(u):
     log_it(u["id"], "PROMO_APPLIED", code, request.remote_addr)
     return jsonify({"message":"Code appliqué !", "expires_at":exp})
 
-# ── ACTIVATION KEYS ───────────────────────────────────────────────────────────────
+# ── ACTIVATION KEYS (ACHAT SITE WEB) ─────────────────────────────────────────────
+
 @app.post("/api/keys/generate")
 def generate_key():
+    """
+    Appelé par le site web après un paiement réussi.
+    Nécessite un secret partagé (WEBHOOK_SECRET) pour sécuriser l'appel.
+    En mode démo : accepte sans vérification.
+    """
     d      = request.json or {}
     plan   = d.get("plan", "monthly")
     email  = d.get("email", "").strip().lower()
     secret = d.get("secret", "")
 
+    # Sécurité : vérifie le secret partagé
     expected = os.environ.get("WEBHOOK_SECRET", "araxis_demo_secret")
     if secret != expected:
         return jsonify({"error": "Non autorisé"}), 401
@@ -301,9 +274,13 @@ def generate_key():
     log_it(None, "KEY_GENERATED", f"{key} plan={plan} email={email}", request.remote_addr)
     return jsonify({"key": key, "plan": plan})
 
+
 @app.post("/api/keys/redeem")
 @auth_required
 def redeem_key(u):
+    """
+    Le client entre sa clé dans le launcher → active son abonnement.
+    """
     key_str = (request.json or {}).get("key", "").strip().upper()
     with get_db() as con:
         row = con.execute(
@@ -325,6 +302,7 @@ def redeem_key(u):
         con.commit()
     log_it(u["id"], "KEY_REDEEMED", key_str, request.remote_addr)
     return jsonify({"message": "Clé activée !", "plan": row["plan"], "expires_at": exp})
+
 
 # ── ADMIN ─────────────────────────────────────────────────────────────────────────
 @app.get("/api/admin/users")
