@@ -6,7 +6,17 @@ from flask_cors import CORS
 import sqlite3, bcrypt, jwt, uuid, datetime, secrets, os, random, string
 
 app = Flask(__name__)
-CORS(app)
+
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        res = app.make_default_options_response()
+        res.headers["Access-Control-Allow-Origin"] = "*"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        res.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        return res
 
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 DB_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "araxis.db")
@@ -63,7 +73,6 @@ def init_db():
             ts      TEXT DEFAULT (datetime('now'))
         );
         """)
-        # Admin par défaut
         try:
             uid = str(uuid.uuid4())
             pw  = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode()
@@ -122,7 +131,6 @@ def log_it(uid, action, details="", ip=""):
         con.commit()
 
 def gen_activation_key(plan):
-    """Génère une clé du type ARX-MO-XXXXX-XXXXX-XXXXX"""
     chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
     seg = lambda: ''.join(random.choices(chars, k=5))
     pfx = {"weekly": "WK", "monthly": "MO", "lifetime": "LT"}.get(plan, "XX")
@@ -240,69 +248,44 @@ def apply_promo(u):
     log_it(u["id"], "PROMO_APPLIED", code, request.remote_addr)
     return jsonify({"message":"Code appliqué !", "expires_at":exp})
 
-# ── ACTIVATION KEYS (ACHAT SITE WEB) ─────────────────────────────────────────────
-
+# ── ACTIVATION KEYS ───────────────────────────────────────────────────────────────
 @app.post("/api/keys/generate")
 def generate_key():
-    """
-    Appelé par le site web après un paiement réussi.
-    Nécessite un secret partagé (WEBHOOK_SECRET) pour sécuriser l'appel.
-    En mode démo : accepte sans vérification.
-    """
     d      = request.json or {}
     plan   = d.get("plan", "monthly")
     email  = d.get("email", "").strip().lower()
     secret = d.get("secret", "")
-
-    # Sécurité : vérifie le secret partagé
     expected = os.environ.get("WEBHOOK_SECRET", "araxis_demo_secret")
     if secret != expected:
         return jsonify({"error": "Non autorisé"}), 401
-
     if plan not in PLANS:
         return jsonify({"error": "Plan invalide"}), 400
-
     key = gen_activation_key(plan)
     kid = str(uuid.uuid4())
     with get_db() as con:
-        con.execute(
-            "INSERT INTO activation_keys (id,key,plan,email) VALUES (?,?,?,?)",
-            (kid, key, plan, email)
-        )
+        con.execute("INSERT INTO activation_keys (id,key,plan,email) VALUES (?,?,?,?)", (kid, key, plan, email))
         con.commit()
-
     log_it(None, "KEY_GENERATED", f"{key} plan={plan} email={email}", request.remote_addr)
     return jsonify({"key": key, "plan": plan})
-
 
 @app.post("/api/keys/redeem")
 @auth_required
 def redeem_key(u):
-    """
-    Le client entre sa clé dans le launcher → active son abonnement.
-    """
     key_str = (request.json or {}).get("key", "").strip().upper()
     with get_db() as con:
-        row = con.execute(
-            "SELECT * FROM activation_keys WHERE key=? AND redeemed=0", (key_str,)
-        ).fetchone()
+        row = con.execute("SELECT * FROM activation_keys WHERE key=? AND redeemed=0", (key_str,)).fetchone()
         if not row:
             return jsonify({"error": "Clé invalide ou déjà utilisée"}), 400
         row = dict(row)
         days = PLANS.get(row["plan"], 30)
         exp  = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat()
-        con.execute(
-            "INSERT INTO subscriptions (id,user_id,plan,expires_at) VALUES (?,?,?,?)",
-            (str(uuid.uuid4()), u["id"], row["plan"], exp)
-        )
-        con.execute(
-            "UPDATE activation_keys SET redeemed=1, user_id=?, redeemed_at=datetime('now') WHERE id=?",
-            (u["id"], row["id"])
-        )
+        con.execute("INSERT INTO subscriptions (id,user_id,plan,expires_at) VALUES (?,?,?,?)",
+                    (str(uuid.uuid4()), u["id"], row["plan"], exp))
+        con.execute("UPDATE activation_keys SET redeemed=1, user_id=?, redeemed_at=datetime('now') WHERE id=?",
+                    (u["id"], row["id"]))
         con.commit()
     log_it(u["id"], "KEY_REDEEMED", key_str, request.remote_addr)
     return jsonify({"message": "Clé activée !", "plan": row["plan"], "expires_at": exp})
-
 
 # ── ADMIN ─────────────────────────────────────────────────────────────────────────
 @app.get("/api/admin/users")
@@ -393,9 +376,7 @@ def admin_promos(u):
 @admin_required
 def admin_keys(u):
     with get_db() as con:
-        rows = con.execute(
-            "SELECT * FROM activation_keys ORDER BY created_at DESC LIMIT 300"
-        ).fetchall()
+        rows = con.execute("SELECT * FROM activation_keys ORDER BY created_at DESC LIMIT 300").fetchall()
     return jsonify([dict(r) for r in rows])
 
 if __name__ == "__main__":
