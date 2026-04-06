@@ -378,7 +378,24 @@ def admin_keys(u):
     with get_db() as con:
         rows = con.execute("SELECT * FROM activation_keys ORDER BY created_at DESC LIMIT 300").fetchall()
     return jsonify([dict(r) for r in rows])
+from flask import send_file
+import io
 
+CHEAT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CHEAT.enc")
+
+@app.get("/api/download/cheat")
+@auth_required
+def download_cheat(u):
+    sub = active_sub(u["id"])
+    if not sub:
+        return jsonify({"error": "Abonnement requis"}), 403
+    if not os.path.exists(CHEAT_PATH):
+        return jsonify({"error": "Fichier introuvable"}), 404
+    with open(CHEAT_PATH, "rb") as f:
+        data = f.read()
+    log_it(u["id"], "DOWNLOAD", "", request.remote_addr)
+    return send_file(io.BytesIO(data), mimetype="application/octet-stream", download_name="cheat.enc")
+    
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"AraxisLauncher API → http://localhost:{port}")
